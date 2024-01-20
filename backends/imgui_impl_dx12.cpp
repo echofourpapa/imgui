@@ -70,7 +70,10 @@ struct ImGui_ImplDX12_Data
     ImGui_ImplDX12_RenderBuffers* pFrameResources;
     UINT                        frameIndex;
 
-    ImGui_ImplDX12_Data()       { memset((void*)this, 0, sizeof(*this)); frameIndex = UINT_MAX; }
+    bool hdr;
+    float maxNits;
+
+    ImGui_ImplDX12_Data() { memset((void*)this, 0, sizeof(*this)); frameIndex = UINT_MAX; hdr = false; maxNits = 600.0; }
 };
 
 // Backend data stored in io.BackendRendererUserData to allow support for multiple Dear ImGui contexts
@@ -94,6 +97,12 @@ struct VERTEX_CONSTANT_BUFFER_DX12
     float   mvp[4][4];
 };
 
+struct PIXEL_CONSTANT_BUFFER_DX12
+{
+    UINT mode;
+    float maxNits;
+};
+
 // Functions
 static void ImGui_ImplDX12_SetupRenderState(ImDrawData* draw_data, ID3D12GraphicsCommandList* ctx, ImGui_ImplDX12_RenderBuffers* fr)
 {
@@ -115,6 +124,14 @@ static void ImGui_ImplDX12_SetupRenderState(ImDrawData* draw_data, ID3D12Graphic
             { (R+L)/(L-R),  (T+B)/(B-T),    0.5f,       1.0f },
         };
         memcpy(&vertex_constant_buffer.mvp, mvp, sizeof(mvp));
+    }
+
+    PIXEL_CONSTANT_BUFFER_DX12 pixel_constant_buffer;
+    {
+        UINT mode = bd->hdr ? 1u : 0u;
+        float maxNits = bd->maxNits;
+        memcpy(&pixel_constant_buffer.mode, &mode, sizeof(mode));
+        memcpy(&pixel_constant_buffer.maxNits, &maxNits, sizeof(maxNits));
     }
 
     // Setup viewport
@@ -146,6 +163,7 @@ static void ImGui_ImplDX12_SetupRenderState(ImDrawData* draw_data, ID3D12Graphic
     ctx->SetPipelineState(bd->pPipelineState);
     ctx->SetGraphicsRootSignature(bd->pRootSignature);
     ctx->SetGraphicsRoot32BitConstants(0, 16, &vertex_constant_buffer, 0);
+    ctx->SetGraphicsRoot32BitConstants(1, 2, &pixel_constant_buffer, 0);
 
     // Setup blend factor
     const float blend_factor[4] = { 0.f, 0.f, 0.f, 0.f };
@@ -277,7 +295,7 @@ void ImGui_ImplDX12_RenderDrawData(ImDrawData* draw_data, ID3D12GraphicsCommandL
                 const D3D12_RECT r = { (LONG)clip_min.x, (LONG)clip_min.y, (LONG)clip_max.x, (LONG)clip_max.y };
                 D3D12_GPU_DESCRIPTOR_HANDLE texture_handle = {};
                 texture_handle.ptr = (UINT64)pcmd->GetTexID();
-                ctx->SetGraphicsRootDescriptorTable(1, texture_handle);
+                ctx->SetGraphicsRootDescriptorTable(2, texture_handle);
                 ctx->RSSetScissorRects(1, &r);
                 ctx->DrawIndexedInstanced(pcmd->ElemCount, 1, pcmd->IdxOffset + global_idx_offset, pcmd->VtxOffset + global_vtx_offset, 0);
             }
@@ -461,7 +479,7 @@ bool    ImGui_ImplDX12_CreateDeviceObjects()
         descRange.RegisterSpace = 0;
         descRange.OffsetInDescriptorsFromTableStart = 0;
 
-        D3D12_ROOT_PARAMETER param[2] = {};
+        D3D12_ROOT_PARAMETER param[3] = {};
 
         param[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         param[0].Constants.ShaderRegister = 0;
@@ -469,10 +487,16 @@ bool    ImGui_ImplDX12_CreateDeviceObjects()
         param[0].Constants.Num32BitValues = 16;
         param[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
-        param[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        param[1].DescriptorTable.NumDescriptorRanges = 1;
-        param[1].DescriptorTable.pDescriptorRanges = &descRange;
+        param[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        param[1].Constants.ShaderRegister = 1;
+        param[1].Constants.RegisterSpace = 0;
+        param[1].Constants.Num32BitValues = 2;
         param[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        param[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        param[2].DescriptorTable.NumDescriptorRanges = 1;
+        param[2].DescriptorTable.pDescriptorRanges = &descRange;
+        param[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         // Bilinear sampling is required by default. Set 'io.Fonts->Flags |= ImFontAtlasFlags_NoBakedLines' or 'style.AntiAliasedLinesUseTex = false' to allow point/nearest sampling.
         D3D12_STATIC_SAMPLER_DESC staticSampler = {};
@@ -611,12 +635,55 @@ bool    ImGui_ImplDX12_CreateDeviceObjects()
             SamplerState sampler0 : register(s0);\
             Texture2D texture0 : register(t0);\
             \
+            cbuffer pixelBuffer : register(b1) \
+            {\
+              uint mode; \
+              float maxNits;\
+            };\
+            \
+            float3 sRGBToLinear(float3 color)\
+            {\
+                return color > 0.04045f ? pow((color + 0.055f) / 1.055f, 2.4f) : color / 12.92f;\
+            }\
+            \
+            float3 Rec709ToRec2020(float3 color)\
+            {\
+                static const float3x3 conversion =\
+                {\
+                    0.627402, 0.329292, 0.043306,\
+                    0.069095, 0.919544, 0.011360,\
+                    0.016394, 0.088028, 0.895578\
+                };\
+                return mul(conversion, color);\
+            }\
+            \
+            float3 LinearToST2084(float3 color)\
+            {\
+                float m1 = 2610.0 / 4096.0 / 4;\
+                float m2 = 2523.0 / 4096.0 * 128;\
+                float c1 = 3424.0 / 4096.0;\
+                float c2 = 2413.0 / 4096.0 * 32;\
+                float c3 = 2392.0 / 4096.0 * 32;\
+                float3 cp = pow(abs(color), m1);\
+                return pow((c1 + c2 * cp) / (1 + c3 * cp), m2);\
+            }\
+            \
             float4 main(PS_INPUT input) : SV_Target\
             {\
               float4 out_col = input.col * texture0.Sample(sampler0, input.uv); \
+              if(mode == 1)\
+              {\
+                out_col.rgb = sRGBToLinear(out_col.rgb); \
+                \
+                const float st2084max = 10000.0; \
+                const float hdrScalar = maxNits / st2084max; \
+                \
+                out_col.rgb = Rec709ToRec2020(out_col.rgb); \
+                \
+                out_col.rgb = LinearToST2084(out_col.rgb * hdrScalar); \
+              }\
               return out_col; \
             }";
-
         if (FAILED(D3DCompile(pixelShader, strlen(pixelShader), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &pixelShaderBlob, nullptr)))
         {
             vertexShaderBlob->Release();
@@ -676,6 +743,15 @@ bool    ImGui_ImplDX12_CreateDeviceObjects()
     ImGui_ImplDX12_CreateFontsTexture();
 
     return true;
+}
+
+void ImGui_ImplDX12_SetHDR(bool hdr, float maxNits)
+{
+    ImGui_ImplDX12_Data* bd = ImGui_ImplDX12_GetBackendData();
+    if (!bd)
+        return;
+    bd->hdr = hdr;
+    bd->maxNits = maxNits;
 }
 
 void    ImGui_ImplDX12_InvalidateDeviceObjects()
